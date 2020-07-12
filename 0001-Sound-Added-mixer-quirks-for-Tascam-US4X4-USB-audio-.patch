@@ -1,0 +1,457 @@
+From 244b8e565d3e54bb4d75955e06e4aa550649a2ab Mon Sep 17 00:00:00 2001
+From: Guy Sherman <guy@guysherman.com>
+Date: Sun, 21 Jun 2020 21:25:14 +1200
+Subject: [PATCH] Sound: Added mixer quirks for Tascam US4X4 USB audio
+ interface
+
+While the Tascam US4X4 is class compliant, it has an internal
+mixer which is not. The internal mixer controls how the
+front inputs are monitored, whether the front inputs are enabled
+and the routing of inputs to the rear line-out pairs.
+
+Without the ability to control the internal mixer, the device
+operates in "Standalone" mode, which enables all inputs, sets
+input monitoring to "mono" for all inputs, and routes the
+monitor mix out of both rear line-out pairs.
+
+Signed-off-by: Guy Sherman <guy@guysherman.com>
+---
+ sound/usb/Makefile       |   1 +
+ sound/usb/mixer_quirks.c |   4 +
+ sound/usb/mixer_us4x4.c  | 347 +++++++++++++++++++++++++++++++++++++++
+ sound/usb/mixer_us4x4.h  |  35 ++++
+ 4 files changed, 387 insertions(+)
+ create mode 100644 sound/usb/mixer_us4x4.c
+ create mode 100644 sound/usb/mixer_us4x4.h
+
+diff --git a/sound/usb/Makefile b/sound/usb/Makefile
+index 56031026b113..b48652db311a 100644
+--- a/sound/usb/Makefile
++++ b/sound/usb/Makefile
+@@ -13,6 +13,7 @@ snd-usb-audio-objs := 	card.o \
+ 			mixer_scarlett.o \
+ 			mixer_scarlett_gen2.o \
+ 			mixer_us16x08.o \
++			mixer_us4x4.o \
+ 			mixer_s1810c.o \
+ 			pcm.o \
+ 			power.o \
+diff --git a/sound/usb/mixer_quirks.c b/sound/usb/mixer_quirks.c
+index cec1cfd7edb7..85fed5f595b1 100644
+--- a/sound/usb/mixer_quirks.c
++++ b/sound/usb/mixer_quirks.c
+@@ -34,6 +34,7 @@
+ #include "mixer_scarlett.h"
+ #include "mixer_scarlett_gen2.h"
+ #include "mixer_us16x08.h"
++#include "mixer_us4x4.h"
+ #include "mixer_s1810c.h"
+ #include "helper.h"
+ 
+@@ -2614,6 +2615,9 @@ int snd_usb_mixer_apply_create_quirk(struct usb_mixer_interface *mixer)
+ 	case USB_ID(0x0644, 0x8047):
+ 		err = snd_us16x08_controls_create(mixer);
+ 		break;
++	case USB_ID(0x0644, 0x804e): /* Tascam US-4x4 */
++		err = snd_us4x4_controls_create(mixer);
++		break;
+ 	case USB_ID(0x041e, 0x3020):
+ 	case USB_ID(0x041e, 0x3040):
+ 	case USB_ID(0x041e, 0x3042):
+diff --git a/sound/usb/mixer_us4x4.c b/sound/usb/mixer_us4x4.c
+new file mode 100644
+index 000000000000..1945a47307c8
+--- /dev/null
++++ b/sound/usb/mixer_us4x4.c
+@@ -0,0 +1,347 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ *   Tascam US-4x4 ALSA driver
++ *
++ *   Copyright (c) 2020 by Guy Sherman (guy@guysherman.com)
++ */
++
++#include <linux/slab.h>
++#include <linux/usb.h>
++#include <linux/usb/audio-v2.h>
++
++#include <sound/core.h>
++#include <sound/control.h>
++
++#include "usbaudio.h"
++#include "mixer.h"
++#include "helper.h"
++
++#include "mixer_us4x4.h"
++
++static int snd_us4x4_send_ctl_out_message(struct snd_usb_audio *chip,
++	unsigned char command,
++	unsigned short index,
++	unsigned short value)
++{
++	return snd_usb_ctl_msg(chip->dev,
++		usb_sndctrlpipe(chip->dev, 0), command,
++		SND_US4X4_URB_CTRL_OUT, value, index, NULL, 0);
++}
++
++static int snd_us4x4_send_ctl_in_message(struct snd_usb_audio *chip,
++	unsigned char command,
++	unsigned short index,
++	unsigned short value,
++	void *data,
++	unsigned short size)
++{
++	return snd_usb_ctl_msg(chip->dev,
++		usb_rcvctrlpipe(chip->dev, 0), command,
++		SND_US4X4_URB_CTRL_IN, value, index, data, size);
++}
++
++static int snd_us4x4_line_out_info(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_info *uinfo)
++{
++	static char *texts[3] = {
++		"Monitor Mix", "PC Out 1 & 2", "PC Out 3 & 4"
++	};
++	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
++	uinfo->count = 1;
++	uinfo->value.enumerated.items = 3;
++	if (uinfo->value.enumerated.item > 2)
++		uinfo->value.enumerated.item = 2;
++	strcpy(uinfo->value.enumerated.name,
++		texts[uinfo->value.enumerated.item]);
++	return 0;
++}
++
++static int snd_us4x4_line_out_get(struct snd_kcontrol *kcontrol,
++					struct snd_ctl_elem_value *ucontrol)
++{
++	struct usb_mixer_elem_info *elem = kcontrol->private_data;
++	struct snd_usb_audio *chip = elem->head.mixer->chip;
++	int index = ucontrol->id.index;
++	unsigned char data = 0;
++	int err;
++
++	err = snd_us4x4_send_ctl_in_message(chip,
++		SND_US4X4_URB_REQUEST_ROUTE_GET, index,
++		0, &data, sizeof(unsigned char));
++
++	if (err > 0)
++		elem->cache_val[index] = (int)data;
++	else
++		usb_audio_err(chip,
++			"Couldn't read data from chip; Err: %d\n", err);
++
++	ucontrol->value.enumerated.item[0] = elem->cache_val[index];
++	return 0;
++}
++
++static int snd_us4x4_line_out_put(
++	struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct usb_mixer_elem_info *elem = kcontrol->private_data;
++	struct snd_usb_audio *chip = elem->head.mixer->chip;
++	int index = ucontrol->id.index;
++	int val, old_val, err;
++
++	old_val = elem->cache_val[index];
++	val = ucontrol->value.enumerated.item[0];
++	if (val < 0 || val > 2)
++		return -EINVAL;
++
++	err = snd_us4x4_send_ctl_out_message(chip,
++		SND_US4X4_URB_REQUEST_ROUTE_SET, index, val);
++
++	if (err == 0) {
++		elem->cached |= 1 << index;
++		elem->cache_val[index] = val;
++	} else {
++		usb_audio_err(chip, "Failed to set routing, err:%d\n", err);
++		val = old_val;
++	}
++
++	return val == old_val ? 0 : 1;
++}
++
++static const struct snd_kcontrol_new snd_us4x4_line_out_ctl = {
++	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
++	.name = "Rear Line Playback Route",
++	.count = 2,
++	.info = snd_us4x4_line_out_info,
++	.get = snd_us4x4_line_out_get,
++	.put = snd_us4x4_line_out_put,
++	.private_value = 0
++};
++
++static int snd_us4x4_monitor_mode_info(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_info *uinfo)
++{
++	static char *texts[2] = {
++		"Mono", "Stereo"
++	};
++	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
++	uinfo->count = 1;
++	uinfo->value.enumerated.items = 2;
++	if (uinfo->value.enumerated.item > 1)
++		uinfo->value.enumerated.item = 1;
++	strcpy(uinfo->value.enumerated.name,
++		texts[uinfo->value.enumerated.item]);
++	return 0;
++}
++
++static int snd_us4x4_monitor_mode_get(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct usb_mixer_elem_info *elem = kcontrol->private_data;
++	struct snd_usb_audio *chip = elem->head.mixer->chip;
++	int index = ucontrol->id.index;
++	unsigned char data = 0;
++	int err;
++
++	err = snd_us4x4_send_ctl_in_message(chip,
++		SND_US4X4_URB_REQUEST_MONITOR_GET,
++		index, 0, &data, sizeof(unsigned char));
++
++	if (err > 0)
++		elem->cache_val[index] = (int)data;
++	else
++		usb_audio_err(chip,
++			"Couldn't read data from chip; Err: %d\n", err);
++
++	ucontrol->value.enumerated.item[0] = elem->cache_val[index];
++	return 0;
++}
++
++static int snd_us4x4_monitor_mode_put(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct usb_mixer_elem_info *elem = kcontrol->private_data;
++	struct snd_usb_audio *chip = elem->head.mixer->chip;
++	int index = ucontrol->id.index;
++	int val, old_val, err;
++
++	old_val = elem->cache_val[index];
++	val = ucontrol->value.enumerated.item[0];
++	if (val < 0 || val > 1)
++		return -EINVAL;
++
++	err = snd_us4x4_send_ctl_out_message(chip,
++		SND_US4X4_URB_REQUEST_MONITOR_SET,
++		index, val);
++
++	if (err == 0) {
++		elem->cached |= 1 << index;
++		elem->cache_val[index] = val;
++	} else {
++		usb_audio_err(chip, "Failed to set routing, err:%d\n", err);
++		val = old_val;
++	}
++
++	return val == old_val ? 0 : 1;
++}
++
++static const struct snd_kcontrol_new snd_us4x4_monitor_mode_ctl = {
++	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
++	.name = "Front Line Monitor Mode",
++	.count = 2,
++	.info = snd_us4x4_monitor_mode_info,
++	.get = snd_us4x4_monitor_mode_get,
++	.put = snd_us4x4_monitor_mode_put,
++	.private_value = 0
++};
++
++static int snd_us4x4_input_enable_info(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_info *uinfo)
++{
++	static char *texts[2] = {
++		"Off", "On"
++	};
++	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
++	uinfo->count = 1;
++	uinfo->value.enumerated.items = 2;
++	if (uinfo->value.enumerated.item > 1)
++		uinfo->value.enumerated.item = 1;
++	strcpy(uinfo->value.enumerated.name,
++		texts[uinfo->value.enumerated.item]);
++	return 0;
++}
++
++static int snd_us4x4_input_enable_get(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct usb_mixer_elem_info *elem = kcontrol->private_data;
++	struct snd_usb_audio *chip = elem->head.mixer->chip;
++	int index = ucontrol->id.index;
++	unsigned char data = 0;
++	int err;
++
++	err = snd_us4x4_send_ctl_in_message(chip,
++		SND_US4X4_URB_REQUEST_INPUT_GET,
++		index, 0, &data, sizeof(unsigned char));
++
++	if (err > 0)
++		elem->cache_val[index] = (int)data;
++	else
++		usb_audio_err(chip,
++			"Couldn't read data from chip; Err: %d\n", err);
++
++	ucontrol->value.enumerated.item[0] = elem->cache_val[index];
++	return 0;
++}
++
++static int snd_us4x4_input_enable_put(struct snd_kcontrol *kcontrol,
++	struct snd_ctl_elem_value *ucontrol)
++{
++	struct usb_mixer_elem_info *elem = kcontrol->private_data;
++	struct snd_usb_audio *chip = elem->head.mixer->chip;
++	int index = ucontrol->id.index;
++	int val, old_val, err;
++
++	old_val = elem->cache_val[index];
++	val = ucontrol->value.enumerated.item[0];
++	if (val < 0 || val > 1)
++		return -EINVAL;
++
++	err = snd_us4x4_send_ctl_out_message(chip,
++		SND_US4X4_URB_REQUEST_INPUT_SET, index, val);
++
++	if (err == 0) {
++		elem->cached |= 1 << index;
++		elem->cache_val[index] = val;
++	} else {
++		usb_audio_err(chip, "Failed to set routing, err:%d\n", err);
++		val = old_val;
++	}
++
++	return val == old_val ? 0 : 1;
++}
++
++static const struct snd_kcontrol_new snd_us4x4_input_enable_ctl = {
++	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
++	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE,
++	.name = "Line Capture Switch",
++	.count = 4,
++	.info = snd_us4x4_input_enable_info,
++	.get = snd_us4x4_input_enable_get,
++	.put = snd_us4x4_input_enable_put,
++	.private_value = 0
++};
++
++int snd_us4x4_controls_create(struct usb_mixer_interface *mixer)
++{
++	struct snd_kcontrol *route_kctl, *monitor_kctl, *input_kctl;
++	struct usb_mixer_elem_info *route_elem, *monitor_elem, *input_elem;
++	int err;
++
++	route_elem = kzalloc(sizeof(*route_elem), GFP_KERNEL);
++	if (!route_elem)
++		return -ENOMEM;
++
++	route_elem->head.mixer = mixer;
++	route_elem->head.resume = NULL;
++	route_elem->control = 0;
++	route_elem->idx_off = 0;
++	route_elem->head.id = 0;
++	route_elem->val_type = USB_MIXER_U32;
++	route_elem->channels = 2;
++	route_elem->private_data = NULL;
++	route_elem->cache_val[0] = SND_US4X4_ROUTE_MODE_MIX;
++	route_elem->cached |= 1 << 0;
++	route_elem->cache_val[1] = SND_US4X4_ROUTE_MODE_MIX;
++	route_elem->cached |= 1 << 1;
++
++	route_kctl = snd_ctl_new1(&snd_us4x4_line_out_ctl, route_elem);
++	err = snd_usb_mixer_add_control(&route_elem->head, route_kctl);
++
++	monitor_elem = kzalloc(sizeof(*monitor_elem), GFP_KERNEL);
++	if (!monitor_elem)
++		return -ENOMEM;
++
++	monitor_elem->head.mixer = mixer;
++	monitor_elem->head.resume = NULL;
++	monitor_elem->control = 0;
++	monitor_elem->idx_off = 0;
++	monitor_elem->head.id = 0;
++	monitor_elem->val_type = USB_MIXER_U32;
++	monitor_elem->channels = 2;
++	monitor_elem->private_data = NULL;
++	monitor_elem->cache_val[0] = SND_US4X4_MONITOR_MODE_MONO;
++	monitor_elem->cached |= 1 << 0;
++	monitor_elem->cache_val[1] = SND_US4X4_MONITOR_MODE_MONO;
++	monitor_elem->cached |= 1 << 1;
++
++	monitor_kctl = snd_ctl_new1(&snd_us4x4_monitor_mode_ctl, monitor_elem);
++	err = snd_usb_mixer_add_control(&monitor_elem->head, monitor_kctl);
++
++	input_elem = kzalloc(sizeof(*input_elem), GFP_KERNEL);
++	if (!input_elem)
++		return -ENOMEM;
++
++	input_elem->head.mixer = mixer;
++	input_elem->head.resume = NULL;
++	input_elem->control = 0;
++	input_elem->idx_off = 0;
++	input_elem->head.id = 0;
++	input_elem->val_type = USB_MIXER_U32;
++	input_elem->channels = 4;
++	input_elem->private_data = NULL;
++	input_elem->cache_val[0] = SND_US4X4_INPUT_MODE_ON;
++	input_elem->cached |= 1 << 0;
++	input_elem->cache_val[1] = SND_US4X4_INPUT_MODE_ON;
++	input_elem->cached |= 1 << 1;
++	input_elem->cache_val[2] = SND_US4X4_INPUT_MODE_ON;
++	input_elem->cached |= 1 << 2;
++	input_elem->cache_val[3] = SND_US4X4_INPUT_MODE_ON;
++	input_elem->cached |= 1 << 3;
++
++	input_kctl = snd_ctl_new1(&snd_us4x4_input_enable_ctl, input_elem);
++	err = snd_usb_mixer_add_control(&input_elem->head, input_kctl);
++
++	return err;
++}
+diff --git a/sound/usb/mixer_us4x4.h b/sound/usb/mixer_us4x4.h
+new file mode 100644
+index 000000000000..43833af79865
+--- /dev/null
++++ b/sound/usb/mixer_us4x4.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef __USB_MIXER_US4X4_H
++#define __USB_MIXER_US4X4_H
++
++// this goes in bmRequestType
++#define SND_US4X4_URB_CTRL_OUT 0x40
++#define SND_US4X4_URB_CTRL_IN 0xc0
++
++// these go in bRequest
++// Command to get source for Line Outs
++#define SND_US4X4_URB_REQUEST_ROUTE_GET 0x09
++// Command to set source for Line Outs
++#define SND_US4X4_URB_REQUEST_ROUTE_SET 0x0a
++// Command to get monitoring mode for input pairs
++#define SND_US4X4_URB_REQUEST_MONITOR_GET 0x07
++// Command to set monitoring mode for input pairs
++#define SND_US4X4_URB_REQUEST_MONITOR_SET 0x08
++// Command to get inputs on and off
++#define SND_US4X4_URB_REQUEST_INPUT_GET 0x05
++// Command to set inputs on and off
++#define SND_US4X4_URB_REQUEST_INPUT_SET 0x06
++
++#define SND_US4X4_ROUTE_MODE_MIX 0x00
++#define SND_US4X4_ROUTE_MODE_OUT12 0x01
++#define SND_US4X4_ROUTE_MODE_OUT34 0x02
++
++#define SND_US4X4_MONITOR_MODE_MONO 0x00
++#define SND_US4X4_MONITOR_MODE_STEREO 0x01
++
++#define SND_US4X4_INPUT_MODE_OFF 0x00
++#define SND_US4X4_INPUT_MODE_ON 0x01
++
++int snd_us4x4_controls_create(struct usb_mixer_interface *mixer);
++
++#endif /* __USB_MIXER_US4X4_H */
+-- 
+2.25.1
+
